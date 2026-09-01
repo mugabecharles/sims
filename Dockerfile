@@ -1,10 +1,9 @@
 # ─────────────────────────────────────────────────────────────
-# Stage 1: Node — build the Vite/React frontend
+# Stage 1: Node — build Vite/React frontend
 # ─────────────────────────────────────────────────────────────
-FROM node:20-alpine AS node_builder
+FROM node:20-slim AS node_builder
 
 WORKDIR /app
-
 COPY package*.json ./
 RUN npm ci --legacy-peer-deps
 
@@ -12,36 +11,36 @@ COPY resources/js   ./resources/js
 COPY resources/css  ./resources/css
 COPY vite.config.js tsconfig.json ./
 RUN mkdir -p resources/views && echo "" > resources/views/app.blade.php
-
 RUN npm run build
 
 # ─────────────────────────────────────────────────────────────
-# Stage 2: PHP production image
+# Stage 2: PHP on Debian (more stable than Alpine for production)
 # ─────────────────────────────────────────────────────────────
-FROM php:8.3-fpm-alpine
+FROM php:8.3-fpm-bookworm
 
-# System dependencies
-RUN apk add --no-cache \
+# Install system packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
         nginx \
         supervisor \
         curl \
+        unzip \
         libpng-dev \
-        libjpeg-turbo-dev \
-        freetype-dev \
+        libjpeg-dev \
+        libfreetype6-dev \
         libzip-dev \
-        oniguruma-dev \
-        icu-dev \
-        shadow \
+        libicu-dev \
+        libonig-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
     && docker-php-ext-install -j$(nproc) \
-        pdo pdo_mysql mbstring exif pcntl bcmath gd zip intl opcache
+        pdo pdo_mysql mbstring exif pcntl bcmath gd zip intl opcache \
+    && rm -rf /var/lib/apt/lists/*
 
 # Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 WORKDIR /var/www/html
 
-# Install PHP deps (no dev, optimized)
+# Install PHP dependencies
 COPY composer.json composer.lock ./
 RUN composer install \
         --no-dev \
@@ -50,50 +49,45 @@ RUN composer install \
         --no-interaction \
         --prefer-dist
 
-# Copy full application
+# Copy application
 COPY . .
 
-# Copy built frontend from node stage
+# Copy built assets
 COPY --from=node_builder /app/public/build ./public/build
 
-# Run composer post-install scripts
+# Post-install
 RUN composer run-script post-autoload-dump --no-interaction 2>/dev/null || true
 
-# Nginx config
-COPY docker/nginx.conf /etc/nginx/http.d/default.conf
+# Nginx
+COPY docker/nginx.conf /etc/nginx/sites-available/default
+RUN rm -f /etc/nginx/sites-enabled/default \
+    && ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
 
-# Remove default nginx site
-RUN rm -f /etc/nginx/http.d/default.conf.bak
-
-# Supervisor config
-RUN mkdir -p /etc/supervisor/conf.d
+# Supervisor
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# PHP opcache tuning
-RUN { \
-        echo "opcache.enable=1"; \
-        echo "opcache.memory_consumption=128"; \
-        echo "opcache.max_accelerated_files=10000"; \
-        echo "opcache.revalidate_freq=60"; \
-        echo "opcache.validate_timestamps=0"; \
-    } >> /usr/local/etc/php/conf.d/opcache.ini
+# PHP-FPM: TCP socket
+RUN sed -i 's|listen = /run/php/php8.3-fpm.sock|listen = 127.0.0.1:9000|g' \
+        /etc/php/8.3/fpm/pool.d/www.conf 2>/dev/null || \
+    sed -i 's|listen = /run/php-fpm/www.sock|listen = 127.0.0.1:9000|g' \
+        /usr/local/etc/php-fpm.d/www.conf 2>/dev/null || true
 
-# PHP-FPM: listen on TCP instead of socket (easier with nginx on same container)
-RUN sed -i 's|listen = /run/php-fpm.sock|listen = 127.0.0.1:9000|g' \
-        /usr/local/etc/php-fpm.d/www.conf || true
+# PHP opcache
+RUN { \
+    echo "opcache.enable=1"; \
+    echo "opcache.memory_consumption=128"; \
+    echo "opcache.max_accelerated_files=10000"; \
+    echo "opcache.validate_timestamps=0"; \
+    } > /usr/local/etc/php/conf.d/opcache.ini
 
 # Permissions
 RUN chown -R www-data:www-data /var/www/html \
-    && chmod -R 755 /var/www/html/storage \
-    && chmod -R 755 /var/www/html/bootstrap/cache
+    && chmod -R 755 storage bootstrap/cache
 
 # Startup script
 COPY docker/start.sh /start.sh
 RUN chmod +x /start.sh
 
 EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8080/up || exit 1
 
 CMD ["/start.sh"]
