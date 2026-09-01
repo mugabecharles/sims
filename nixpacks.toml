@@ -1,0 +1,26 @@
+# Railway Nixpacks configuration for Laravel + Node.js
+# This is used if Railway auto-detects instead of using the Dockerfile
+
+[phases.setup]
+nixPkgs = ["php83", "php83Extensions.pdo", "php83Extensions.pdo_mysql",
+           "php83Extensions.mbstring", "php83Extensions.zip",
+           "php83Extensions.gd", "php83Extensions.intl",
+           "php83Extensions.bcmath", "php83Extensions.opcache",
+           "php83Extensions.pcntl", "nodejs_20", "nodePackages.npm"]
+
+[phases.install]
+cmds = [
+  "php $(which composer) install --no-dev --optimize-autoloader --no-interaction",
+  "npm ci --legacy-peer-deps",
+  "npm run build"
+]
+
+[phases.build]
+cmds = [
+  "php artisan config:cache",
+  "php artisan route:cache",
+  "php artisan view:cache"
+]
+
+[start]
+cmd = "php artisan migrate --force && php artisan serve --host=0.0.0.0 --port=${PORT:-8080}"
