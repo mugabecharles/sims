@@ -5,60 +5,71 @@ cd /var/www/html
 # ── 1. Create .env ─────────────────────────────────────────────
 if [ ! -f /var/www/html/.env ]; then
     cp /var/www/html/.env.example /var/www/html/.env
-    echo "==> .env created from .env.example"
+    echo "==> .env created"
 fi
 
-# ── 2. Write env vars into .env ───────────────────────────────
-write_env() {
-    KEY="$1"
-    VALUE="$2"
-    if [ -n "$VALUE" ]; then
-        if grep -q "^${KEY}=" /var/www/html/.env; then
-            sed -i "s|^${KEY}=.*|${KEY}=${VALUE}|" /var/www/html/.env
-        else
-            echo "${KEY}=${VALUE}" >> /var/www/html/.env
-        fi
-    fi
+# ── 2. Write ALL env vars to .env using PHP ────────────────────
+# PHP handles special characters safely — no shell escaping issues
+php -r "
+\$env = file_get_contents('/var/www/html/.env');
+\$vars = [
+    'APP_NAME'         => getenv('APP_NAME')         ?: 'SIMS',
+    'APP_ENV'          => getenv('APP_ENV')           ?: 'production',
+    'APP_DEBUG'        => getenv('APP_DEBUG')         ?: 'false',
+    'APP_URL'          => getenv('APP_URL')           ?: 'http://localhost:8080',
+    'APP_TIMEZONE'     => getenv('APP_TIMEZONE')      ?: 'Africa/Kampala',
+    'APP_KEY'          => getenv('APP_KEY')           ?: '',
+    'DB_CONNECTION'    => 'mysql',
+    'DB_HOST'          => getenv('DB_HOST')           ?: getenv('MYSQLHOST')     ?: '127.0.0.1',
+    'DB_PORT'          => getenv('DB_PORT')           ?: getenv('MYSQLPORT')     ?: '3306',
+    'DB_DATABASE'      => getenv('DB_DATABASE')       ?: getenv('MYSQLDATABASE') ?: 'railway',
+    'DB_USERNAME'      => getenv('DB_USERNAME')       ?: getenv('MYSQLUSER')     ?: 'root',
+    'DB_PASSWORD'      => getenv('DB_PASSWORD')       ?: getenv('MYSQLPASSWORD') ?: '',
+    'SESSION_DRIVER'   => getenv('SESSION_DRIVER')    ?: 'database',
+    'CACHE_STORE'      => getenv('CACHE_STORE')       ?: 'file',
+    'QUEUE_CONNECTION' => getenv('QUEUE_CONNECTION')  ?: 'database',
+    'LOG_LEVEL'        => getenv('LOG_LEVEL')         ?: 'error',
+];
+foreach (\$vars as \$key => \$value) {
+    if (\$value === '' && \$key !== 'DB_PASSWORD' && \$key !== 'APP_KEY') continue;
+    if (preg_match('/^' . preg_quote(\$key, '/') . '=/m', \$env)) {
+        \$env = preg_replace('/^' . preg_quote(\$key, '/') . '=.*/m', \$key . '=' . \$value, \$env);
+    } else {
+        \$env .= PHP_EOL . \$key . '=' . \$value;
+    }
 }
-
-write_env "APP_NAME"         "${APP_NAME:-SIMS}"
-write_env "APP_ENV"          "production"
-write_env "APP_DEBUG"        "false"
-write_env "APP_URL"          "${APP_URL:-http://localhost:8080}"
-write_env "APP_TIMEZONE"     "Africa/Kampala"
-write_env "DB_CONNECTION"    "mysql"
-write_env "DB_HOST"          "${DB_HOST:-${MYSQLHOST:-${MYSQL_HOST:-127.0.0.1}}}"
-write_env "DB_PORT"          "${DB_PORT:-${MYSQLPORT:-${MYSQL_PORT:-3306}}}"
-write_env "DB_DATABASE"      "${DB_DATABASE:-${MYSQLDATABASE:-${MYSQL_DATABASE:-sims}}}"
-write_env "DB_USERNAME"      "${DB_USERNAME:-${MYSQLUSER:-${MYSQL_USER:-root}}}"
-write_env "DB_PASSWORD"      "${DB_PASSWORD:-${MYSQLPASSWORD:-${MYSQL_PASSWORD:-}}}"
-write_env "SESSION_DRIVER"   "database"
-write_env "CACHE_STORE"      "file"
-write_env "QUEUE_CONNECTION" "database"
-write_env "LOG_LEVEL"        "error"
+file_put_contents('/var/www/html/.env', \$env);
+echo 'DB_HOST=' . \$vars['DB_HOST'] . PHP_EOL;
+echo 'DB_DATABASE=' . \$vars['DB_DATABASE'] . PHP_EOL;
+echo 'DB_USERNAME=' . \$vars['DB_USERNAME'] . PHP_EOL;
+echo 'DB_PASSWORD is set: ' . (strlen(\$vars['DB_PASSWORD']) > 0 ? 'YES' : 'NO') . PHP_EOL;
+"
 
 # ── 3. APP_KEY ─────────────────────────────────────────────────
-if [ -n "$APP_KEY" ]; then
-    write_env "APP_KEY" "$APP_KEY"
-    echo "==> APP_KEY loaded from Railway variables"
-else
+if [ -z "$(grep '^APP_KEY=base64' /var/www/html/.env)" ]; then
+    echo "==> Generating APP_KEY..."
     php artisan key:generate --force
-    echo "==> APP_KEY generated"
 fi
 
 # ── 4. Cache ───────────────────────────────────────────────────
-php artisan config:cache  2>/dev/null && echo "==> config cached"  || true
-php artisan route:cache   2>/dev/null && echo "==> routes cached"  || true
-php artisan view:cache    2>/dev/null && echo "==> views cached"   || true
+php artisan config:cache 2>/dev/null && echo "==> config cached" || true
+php artisan route:cache  2>/dev/null && echo "==> routes cached" || true
+php artisan view:cache   2>/dev/null && echo "==> views cached"  || true
 
 # ── 5. Migrations ──────────────────────────────────────────────
-DB=$(grep "^DB_HOST=" /var/www/html/.env | cut -d= -f2)
-if [ "$DB" != "127.0.0.1" ] && [ -n "$DB" ]; then
-    echo "==> Running migrations (DB: $DB)..."
+DB_HOST_VAL=$(php -r "
+\$env = parse_ini_file('/var/www/html/.env');
+echo \$env['DB_HOST'] ?? '';
+")
+echo "==> DB_HOST resolved to: $DB_HOST_VAL"
+
+if [ "$DB_HOST_VAL" != "127.0.0.1" ] && [ -n "$DB_HOST_VAL" ]; then
+    echo "==> Running migrations..."
     php artisan migrate --force 2>&1 && echo "==> Migrations OK" || echo "==> Migration warning"
-    php artisan db:seed --force 2>&1 && echo "==> Seeded OK"      || echo "==> Seed skipped"
+    echo "==> Seeding..."
+    php artisan db:seed --force 2>&1 && echo "==> Seeded OK" || echo "==> Seed skipped"
 else
-    echo "==> Skipping migrations (no external DB)"
+    echo "==> No external DB — skipping migrations"
 fi
 
 # ── 6. Permissions ─────────────────────────────────────────────
